@@ -38,6 +38,14 @@
   绝不伪造更早的历史版本。
 - 提供修订列表与两版本 diff 接口；diff 按成员顺序给出前后贡献与数值差，仅列发生变化的成员，
   非法版本返回 422、不存在的组/窗口/修订返回 404。
+
+封存窗口稳健异常检测（只读）：
+- GET /devices/{device_id}/anomalies?window_start=&threshold= 仅对**已封存**窗口内事件
+  （含落入该窗口的迟到事件）做基于中位数与 MAD（median absolute deviation）的稳健打分：
+  score = 0.6745 * |x - median| / MAD，只返回 score > threshold 的事件，threshold 默认 3.5 且必须 > 0。
+- MAD 为 0（超过半数事件等于中位数）时，除以 0 无定义：按需求把所有**不等于中位数**的事件
+  一律判为异常返回，其 score 记为 null；全部等于中位数则无异常。
+- 设备或窗口不存在返回 404，窗口尚未封存（open）返回 409；接口纯只读，不改变任何现有聚合。
 """
 
 from __future__ import annotations
@@ -71,7 +79,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.4.0", lifespan=lifespan)
+
+# 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
+DEFAULT_ANOMALY_THRESHOLD = 3.5
+MAD_NORMALIZER = 0.6745
 
 
 # ---------- Pydantic 模型 ----------
@@ -159,6 +171,14 @@ class CorrectionOut(BaseModel):
     event_time: datetime
     value: float
     created_at: datetime
+
+
+class AnomalyOut(BaseModel):
+    event_id: str
+    event_time: datetime
+    value: float
+    # 修正 z 分数；MAD 为 0 时分数无定义（除以 0），非中位值一律判为异常，score 返回 null
+    score: Optional[float] = None
 
 
 class GroupCreate(BaseModel):
@@ -907,6 +927,92 @@ def list_corrections(device_id: str) -> list[CorrectionOut]:
             )
             for r in rows
         ]
+
+
+# ---------- 封存窗口稳健异常检测接口 ----------
+
+def _median(values: list[float]) -> float:
+    """有限样本中位数：偶数个时取中间两个的平均值。"""
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+@app.get("/devices/{device_id}/anomalies", response_model=list[AnomalyOut])
+def list_device_anomalies(
+    device_id: str,
+    window_start: datetime = Query(..., description="窗口起始时间（ISO 8601），按设备窗口大小对齐"),
+    threshold: float = Query(default=DEFAULT_ANOMALY_THRESHOLD, gt=0),
+) -> list[AnomalyOut]:
+    """对指定**已封存**窗口内的事件做中位数/MAD 稳健异常检测（只读）。
+
+    score = 0.6745 * |value - median| / MAD（修正 z 分数），仅返回 score > threshold 的事件，
+    threshold 默认 3.5 且必须 > 0，否则返回 422。MAD 为 0 时除以 0 无定义，
+    按需求把所有不等于中位数的事件一律判为异常（score 返回 null）。
+    检测包含封存后到达的迟到事件；纯只读，不改变窗口聚合与修正计数。
+    设备或窗口不存在返回 404，窗口尚未封存（open）返回 409。
+    """
+    w_start = to_epoch(window_start)
+    with db.session() as conn:
+        require_device(conn, device_id)
+        win = conn.execute(
+            "SELECT * FROM windows WHERE device_id = ? AND window_start = ?",
+            (device_id, w_start),
+        ).fetchone()
+        if win is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"window not found for device {device_id} at window_start {window_start.isoformat()}",
+            )
+        if win["status"] != "sealed":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"window at {window_start.isoformat()} is not sealed; "
+                    "anomaly detection is only available on sealed windows"
+                ),
+            )
+
+        rows = conn.execute(
+            "SELECT event_id, event_time, value FROM events"
+            " WHERE device_id = ? AND event_time >= ? AND event_time < ?"
+            " ORDER BY event_time, event_id",
+            (device_id, win["window_start"], win["window_end"]),
+        ).fetchall()
+
+        values = [r["value"] for r in rows]
+        if not values:
+            return []
+
+        median = _median(values)
+        mad = _median([abs(v - median) for v in values])
+
+        anomalies: list[AnomalyOut] = []
+        if mad == 0.0:
+            # MAD 为 0：除以 0 无定义，所有非中位值按异常处理；全等于中位数则无异常
+            for r in rows:
+                if r["value"] != median:
+                    anomalies.append(AnomalyOut(
+                        event_id=r["event_id"],
+                        event_time=to_iso(r["event_time"]),
+                        value=r["value"],
+                        score=None,
+                    ))
+            return anomalies
+
+        for r in rows:
+            score = MAD_NORMALIZER * abs(r["value"] - median) / mad
+            if score > threshold:
+                anomalies.append(AnomalyOut(
+                    event_id=r["event_id"],
+                    event_time=to_iso(r["event_time"]),
+                    value=r["value"],
+                    score=score,
+                ))
+        return anomalies
 
 
 # ---------- 设备组接口 ----------

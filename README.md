@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）与**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）与**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）。
 
 ## 核心语义
 
@@ -38,6 +38,15 @@
   - diff 按**成员顺序**返回每个**发生变化**成员的前后贡献（sum 聚合贡献为窗口 `sum`，avg 聚合贡献为窗口 `avg`）与 `count/sum/avg/correction_count` 的数值差，未变化成员不列出；
   - 版本参数非法（缺失、`<1`、`from >= to`）返回 `422`；组、窗口或任一修订不存在返回 `404`。
 
+### 封存窗口稳健异常检测（只读）
+
+- **只检测已封存窗口**：`GET /devices/{id}/anomalies?window_start=...&threshold=...` 对指定窗口内的全部事件（**包含封存后到达的迟到事件**）按**中位数**与 **MAD（median absolute deviation，绝对偏差中位数）** 计算稳健分数，不受极端离群值拉偏：
+  - `score = 0.6745 * |value - median| / MAD`（即修正 z 分数，0.6745 为正态分布下 `MAD ≈ 0.6745σ` 的换算系数）；
+  - 只返回 `score > threshold` 的事件，`threshold` 默认 **3.5**，必须 **大于 0**（传 `0` 或负数返回 `422`），可按需调大（少报）或调小（多报）。
+- **MAD 为 0 的退化情形**：超过半数事件等于中位数时 MAD=0，除以 0 无定义。此时按需求把所有**不等于中位数**的事件一律判为异常返回，对应 `score` 字段为 `null`（JSON 中可判空）；若窗口内全部事件相等则没有异常。
+- **状态码**：设备不存在或该设备在 `window_start` 处没有窗口（从未有事件落入）返回 `404`；窗口存在但仍是 `open`（未封存）返回 `409`。
+- **纯只读**：检测过程只执行查询，不修改事件、窗口聚合（count/sum/avg/min/max）、封存状态与修正计数。
+
 ## 启动
 
 ### Docker（推荐，一键启动）
@@ -55,6 +64,8 @@ docker compose up --build
 - ReDoc 文档：http://localhost:8000/redoc
 
 停止服务用 `Ctrl+C`（后台模式则 `docker compose down`）。数据保存在 Docker 卷 `telemetry-data` 中，`docker compose down` 不会删除；如需清空可执行 `docker compose down -v`。
+
+Compose 还配置了基于 `/health` 的健康检查（仅用镜像自带 Python，无需额外工具）：可用 `docker compose ps` 查看 `healthy`/`unhealthy` 状态。
 
 或纯 Docker：
 
@@ -432,6 +443,31 @@ curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revision
 - `from_revision` / `to_revision` 均必填且 `>= 1`，且 `from_revision < to_revision`，否则返回 `422`。
 - 组、窗口不存在，或指定的任一 revision 无快照（例如 baseline 之前被伪造的旧版本号）返回 `404`。
 
+### 15. 封存窗口稳健异常检测（中位数 / MAD）
+
+窗口必须**已封存**；检测范围包含迟到事件，接口纯只读。下例窗口 `[10:00, 10:01)` 已封存，其中大部分值贴近 21.5，`evt-spike` 为离群点：
+
+```bash
+curl 'http://localhost:8000/devices/sensor-001/anomalies?window_start=2026-09-22T10:00:00Z'
+# 自定义阈值（默认 3.5，必须 > 0）：
+curl 'http://localhost:8000/devices/sensor-001/anomalies?window_start=2026-09-22T10:00:00Z&threshold=5.0'
+```
+
+```json
+[
+  {
+    "event_id": "evt-spike",
+    "event_time": "2026-09-22T10:00:46Z",
+    "value": 80.2,
+    "score": 134.2255
+  }
+]
+```
+
+- 每个结果给出超阈值事件的 `event_id`、`event_time`、`value` 与稳健 `score`，按 `event_time`、`event_id` 排序；无异常返回 `[]`。
+- 当窗口 MAD 为 0（过半事件等于中位数）时，所有不等于中位数的事件均判为异常，其 `score` 为 `null`。
+- 设备不存在或窗口不存在返回 `404`；窗口尚未封存（`open`）返回 `409`；`threshold <= 0` 返回 `422`。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -445,6 +481,7 @@ curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revision
 | `GET` | `/devices/{device_id}/labels` | 设备当前标签与版本（从未写入为 version 0） |
 | `GET` | `/devices/{device_id}/windows` | 各时间窗聚合值、状态、修正次数（支持 `?status=open\|sealed`） |
 | `GET` | `/devices/{device_id}/corrections` | 迟到数据修正记录 |
+| `GET` | `/devices/{device_id}/anomalies?window_start=&threshold=3.5` | 已封存窗口事件的中位数/MAD 稳健异常检测（只读；窗口不存在 404，未封存 409，threshold≤0 为 422） |
 | `POST` | `/groups` | 创建设备组（固定成员、sum/avg、窗口配置一致校验） |
 | `GET` | `/groups/{group_id}` | 组信息与成员列表 |
 | `GET` | `/groups/{group_id}/windows` | 组窗口汇总列表（支持 `?status=pending\|ready&window_start=...`） |
@@ -464,6 +501,7 @@ tests/
   test_labels.py    # 设备标签测试（规范化/重复键/版本递增/乐观并发/标签筛选/旧库迁移）
   test_groups.py    # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
   test_revisions.py # 修订审计测试（快照留档、diff、422/404、不可变性、旧库 baseline 补档）
+  test_anomalies.py # 封存窗口稳健异常检测测试（中位数/MAD 打分、MAD=0、404/409/422、只读）
 Dockerfile
 docker-compose.yml
 requirements.txt
