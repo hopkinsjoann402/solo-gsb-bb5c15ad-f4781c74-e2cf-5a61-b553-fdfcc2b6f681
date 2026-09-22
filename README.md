@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）与**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）与**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff），还提供**封存窗口稳健异常检测**（对 sealed 窗口按中位数与 MAD 计算 modified z-score，只读、不影响聚合）。
 
 ## 核心语义
 
@@ -38,6 +38,13 @@
   - diff 按**成员顺序**返回每个**发生变化**成员的前后贡献（sum 聚合贡献为窗口 `sum`，avg 聚合贡献为窗口 `avg`）与 `count/sum/avg/correction_count` 的数值差，未变化成员不列出；
   - 版本参数非法（缺失、`<1`、`from >= to`）返回 `422`；组、窗口或任一修订不存在返回 `404`。
 
+### 封存窗口稳健异常检测（只读）
+
+- **仅面向封存窗口**：`GET /devices/{id}/anomalies?window_start=...&threshold=...` 只对 `sealed` 窗口运行；设备不存在或该设备没有对应窗口返回 `404`，窗口存在但仍 `open` 返回 `409`（封存后到达的迟到事件已计入窗口，同样参与检测）。
+- **中位数 / MAD 稳健分数**：设窗口内事件值中位数为 `median`，绝对中位差 `MAD = median(|value - median|)`，每个事件的稳健分数（modified z-score）为 `score = 0.6745 * (value - median) / MAD`；`|score|` **严格大于** `threshold` 判为异常，默认 `threshold=3.5`，且必须大于 `0`（否则 `422`）。返回结果按 `event_time` 升序，每项含 `event_id`、`event_time`、`value`、`score`（带符号，负值表示低于中位值）。
+- **MAD 为 0 的退化口径**：当中位值占多数、无法估计离散尺度时，所有**非中位值一律判为异常**（其 `score` 输出为 JSON `Infinity`）；若窗口内所有值相等，则没有非中位值，返回空列表。
+- **纯只读**：检测只查询事件，不修改窗口聚合、修正记录、组汇总与审计快照。
+
 ## 启动
 
 ### Docker（推荐，一键启动）
@@ -48,7 +55,7 @@
 docker compose up --build
 ```
 
-服务在前台启动（加 `-d` 可后台运行），监听并映射宿主机 **8000** 端口：
+服务在前台启动（加 `-d` 可后台运行），监听并映射宿主机 **8000** 端口。Compose 配置了基于 `/health` 的健康检查（`docker compose ps` 中可见 `healthy` 状态）：
 
 - 健康检查：http://localhost:8000/health
 - Swagger 交互式文档：http://localhost:8000/docs
@@ -432,6 +439,33 @@ curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revision
 - `from_revision` / `to_revision` 均必填且 `>= 1`，且 `from_revision < to_revision`，否则返回 `422`。
 - 组、窗口不存在，或指定的任一 revision 无快照（例如 baseline 之前被伪造的旧版本号）返回 `404`。
 
+### 15. 封存窗口稳健异常检测
+
+对**已封存**窗口按中位数和 MAD 计算稳健分数（只读，默认阈值 3.5）：
+
+```bash
+curl 'http://localhost:8000/devices/sensor-001/anomalies?window_start=2026-09-22T10:00:00Z'
+# 自定义阈值（必须 > 0）：
+curl 'http://localhost:8000/devices/sensor-001/anomalies?window_start=2026-09-22T10:00:00Z&threshold=2.0'
+```
+
+假设窗口内值为 `[21.5, 20.9, 22.0, 80.0]`（中位数 21.75，MAD 0.55），只有 80.0 超过阈值：
+
+```json
+[
+  {
+    "event_id": "evt-spike",
+    "event_time": "2026-09-22T10:00:50Z",
+    "value": 80.0,
+    "score": 71.49
+  }
+]
+```
+
+- `score = 0.6745 * (value - median) / MAD`（modified z-score，带符号），`|score|` **严格大于** `threshold` 才返回；默认 `threshold=3.5`，`threshold <= 0` 返回 `422`。
+- 当 MAD 为 0（中位值占多数，尺度无法估计）时，所有非中位值一律判为异常，`score` 返回 `Infinity`；窗口内所有值相等时返回空列表。
+- 设备不存在或窗口不存在返回 `404`；窗口尚未封存返回 `409`。检测纯只读，不改变任何聚合与修正记录。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -445,6 +479,7 @@ curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revision
 | `GET` | `/devices/{device_id}/labels` | 设备当前标签与版本（从未写入为 version 0） |
 | `GET` | `/devices/{device_id}/windows` | 各时间窗聚合值、状态、修正次数（支持 `?status=open\|sealed`） |
 | `GET` | `/devices/{device_id}/corrections` | 迟到数据修正记录 |
+| `GET` | `/devices/{device_id}/anomalies?window_start=&threshold=` | 封存窗口稳健异常检测（中位数/MAD modified z-score；默认阈值 3.5，仅 sealed，只读） |
 | `POST` | `/groups` | 创建设备组（固定成员、sum/avg、窗口配置一致校验） |
 | `GET` | `/groups/{group_id}` | 组信息与成员列表 |
 | `GET` | `/groups/{group_id}/windows` | 组窗口汇总列表（支持 `?status=pending\|ready&window_start=...`） |
@@ -457,13 +492,14 @@ curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revision
 
 ```
 app/
-  main.py        # FastAPI 应用、遥测聚合、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照逻辑
+  main.py        # FastAPI 应用、遥测聚合、设备标签（版本化/乐观并发）、设备组同步窗口汇总、修订审计快照与封存窗口稳健异常检测逻辑
   db.py          # SQLite 连接、建表（含标签表、append-only 审计表/触发器）、旧库迁移与事务会话
 tests/
   test_api.py       # 端到端测试（水位线/封存/去重/迟到修正/持久化）
   test_labels.py    # 设备标签测试（规范化/重复键/版本递增/乐观并发/标签筛选/旧库迁移）
   test_groups.py    # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
   test_revisions.py # 修订审计测试（快照留档、diff、422/404、不可变性、旧库 baseline 补档）
+  test_anomalies.py # 封存窗口稳健异常检测测试（中位数/MAD 分数、MAD=0 退化口径、阈值校验、404/409/422、只读）
 Dockerfile
 docker-compose.yml
 requirements.txt

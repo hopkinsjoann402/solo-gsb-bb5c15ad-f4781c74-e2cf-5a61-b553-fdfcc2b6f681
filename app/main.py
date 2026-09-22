@@ -38,6 +38,14 @@
   绝不伪造更早的历史版本。
 - 提供修订列表与两版本 diff 接口；diff 按成员顺序给出前后贡献与数值差，仅列发生变化的成员，
   非法版本返回 422、不存在的组/窗口/修订返回 404。
+
+封存窗口稳健异常检测（只读）：
+- GET /devices/{device_id}/anomalies?window_start=...&threshold=... 仅对 sealed 窗口运行；
+- 稳健分数 modified z-score：score = 0.6745 * (value - median) / MAD，
+  MAD = median(|value - median|)，|score| 严格大于 threshold（默认 3.5，必须 > 0）判为异常；
+- MAD 为 0 时（中位值占多数）无法估计尺度，所有非中位值一律判为异常（score 记为 inf）；
+- 设备或窗口不存在返回 404，窗口存在但未封存返回 409，threshold <= 0 返回 422；
+- 检测纯只读，不改变窗口聚合、修正记录与组汇总。
 """
 
 from __future__ import annotations
@@ -47,10 +55,11 @@ import re
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from statistics import median
 from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import db
 
@@ -62,6 +71,9 @@ MAX_LABEL_KEY_LENGTH = 63
 MAX_LABEL_VALUE_LENGTH = 256
 # 规范化后的合法键名：小写字母/数字开头，其余允许下划线、点、连字符
 LABEL_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+# 稳健异常检测默认阈值与尺度系数：modified z-score = 0.6745*(x-median)/MAD
+DEFAULT_ANOMALY_THRESHOLD = 3.5
+MAD_SCORE_SCALE = 0.6745
 
 
 @asynccontextmanager
@@ -71,7 +83,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.4.0", lifespan=lifespan)
 
 
 # ---------- Pydantic 模型 ----------
@@ -159,6 +171,16 @@ class CorrectionOut(BaseModel):
     event_time: datetime
     value: float
     created_at: datetime
+
+
+class AnomalyOut(BaseModel):
+    # score 可能为 inf（MAD 为 0 时），允许 JSON 输出 Infinity 常量
+    model_config = ConfigDict(ser_json_inf_nan="constants")
+
+    event_id: str
+    event_time: datetime
+    value: float
+    score: float  # |modified z-score|（保留符号）；MAD 为 0 时非中位值记为 Infinity
 
 
 class GroupCreate(BaseModel):
@@ -907,6 +929,77 @@ def list_corrections(device_id: str) -> list[CorrectionOut]:
             )
             for r in rows
         ]
+
+
+# ---------- 封存窗口稳健异常检测 ----------
+
+@app.get("/devices/{device_id}/anomalies", response_model=list[AnomalyOut])
+def list_window_anomalies(
+    device_id: str,
+    window_start: datetime = Query(..., description="按 epoch 网格对齐的窗口起点"),
+    threshold: float = Query(default=DEFAULT_ANOMALY_THRESHOLD, gt=0),
+) -> list[AnomalyOut]:
+    """对指定**已封存**窗口内的事件做基于中位数/MAD 的稳健异常检测（只读）。
+
+    - 稳健分数 modified z-score：`0.6745 * (value - median) / MAD`，
+      其中 `MAD = median(|value - median|)`；|score| 严格大于 threshold 判为异常。
+    - MAD 为 0 时尺度无法估计（中位值占多数）：所有非中位值一律判为异常，
+      score 记为 inf（中位值 score 为 0，永远不异常）。
+    - threshold 默认 3.5 且必须 > 0（否则 422）；设备或窗口不存在返回 404；
+      窗口存在但尚未封存返回 409。
+    - 检测纯只读：不触碰窗口聚合、修正记录与组汇总。
+    """
+    w_start = to_epoch(window_start)
+    with db.session() as conn:
+        require_device(conn, device_id)
+        win = conn.execute(
+            "SELECT * FROM windows WHERE device_id = ? AND window_start = ?",
+            (device_id, w_start),
+        ).fetchone()
+        if win is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"window not found: device={device_id}, window_start={to_iso(w_start)}",
+            )
+        if win["status"] != "sealed":
+            raise HTTPException(
+                status_code=409,
+                detail=f"window is not sealed yet: {to_iso(w_start)}",
+            )
+
+        rows = conn.execute(
+            "SELECT event_id, event_time, value FROM events"
+            " WHERE device_id = ? AND event_time >= ? AND event_time < ?"
+            " ORDER BY event_time, event_id",
+            (device_id, win["window_start"], win["window_end"]),
+        ).fetchall()
+
+    values = [r["value"] for r in rows]
+    med = median(values)
+    mad = median(abs(v - med) for v in values)
+
+    anomalies: list[AnomalyOut] = []
+    if mad == 0:
+        # 尺度退化：中位值正常，其余值全部按异常处理
+        for r in rows:
+            if r["value"] != med:
+                anomalies.append(AnomalyOut(
+                    event_id=r["event_id"],
+                    event_time=to_iso(r["event_time"]),
+                    value=r["value"],
+                    score=math.inf,
+                ))
+    else:
+        for r in rows:
+            score = MAD_SCORE_SCALE * (r["value"] - med) / mad
+            if abs(score) > threshold:
+                anomalies.append(AnomalyOut(
+                    event_id=r["event_id"],
+                    event_time=to_iso(r["event_time"]),
+                    value=r["value"],
+                    score=score,
+                ))
+    return anomalies
 
 
 # ---------- 设备组接口 ----------
